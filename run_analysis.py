@@ -13,10 +13,10 @@ RSI_OVERBOUGHT = 75
 RSI_OVERSOLD = 25
 MAX_TRADES_PER_DAY = 5 # Increased for more potential signals in short timeframe
 ENTRY_CUTOFF_TIME = time(15, 30) # No entries after 3:30 PM
-EXIT_TIME = time(15, 55)      # Exit all positions by 3:55 PM
+EXIT_TIME = time(15, 0)      # Exit all positions by 3:00 PM ET - MODIFIED
 
 # --- P&L Modeling Parameters (from backtest.py, simplified for this task) ---
-COMMISSION_PER_TRADE = 1.00 # Simplified to a flat $1 per trade for underlying
+COMMISSION_COST_PCT = 0.0002 # Representing 0.02% for commission/slippage per trade
 
 # --- Manual Indicator Implementations ---
 
@@ -54,13 +54,24 @@ def load_and_prepare_data(csv_filepath="QQQ_1min_data_with_indicators.csv"):
     # Calculate VWAP (anchored daily)
     df['VWAP_D'] = df.groupby(df.index.date, group_keys=False).apply(calculate_vwap)
 
-    # Calculate EMAs for Strategy 1 & 3
-    df['EMA_5'] = calculate_ema(df['close'], length=5) # For Strategy 3
-    df['EMA_9'] = calculate_ema(df['close'], length=9)  # For Strategy 1
-    df['EMA_10'] = calculate_ema(df['close'], length=10) # For Strategy 3
-    df['EMA_21'] = calculate_ema(df['close'], length=21) # For Strategy 1
+    # Calculate EMAs for Strategies
+    df['EMA_5'] = calculate_ema(df['close'], length=5)
+    df['EMA_9'] = calculate_ema(df['close'], length=9)
+    df['EMA_10'] = calculate_ema(df['close'], length=10)
+    df['EMA_21'] = calculate_ema(df['close'], length=21)
 
-    # Use existing RSI_14 from CSV (for Strategy 1 & 2), handle potential typo 'Rsi_14'.
+    # Bollinger Bands for Strategy 4
+    # Manually calculate Bollinger Bands
+    sma_20 = df['close'].rolling(window=20).mean()
+    std_20 = df['close'].rolling(window=20).std()
+    df['BB_UPPER'] = sma_20 + (std_20 * 2)
+    df['BB_MIDDLE'] = sma_20
+    df['BB_LOWER'] = sma_20 - (std_20 * 2)
+
+    # Volume SMA for Strategy 5
+    df['VOLUME_SMA_20'] = df['volume'].rolling(window=20).mean()
+
+    # Use existing RSI_14 from CSV (for Strategy 1, 2, 4), handle potential typo 'Rsi_14'.
     # If RSI_14 is missing entirely, then calculate it.
     if 'RSI_14' not in df.columns:
         if 'Rsi_14' in df.columns:
@@ -95,17 +106,25 @@ def run_backtest(df: pd.DataFrame, strategy_config: dict):
     position_type = None # 'long' or 'short'
     entry_time = None
 
-    # Get strategy-specific parameters
-    profit_target_pct = strategy_config.get('PROFIT_TARGET_PCT', PROFIT_TARGET_PCT)
-    stop_loss_pct = strategy_config.get('STOP_LOSS_PCT', STOP_LOSS_PCT)
-    rsi_overbought = strategy_config.get('RSI_OVERBOUGHT', RSI_OVERBOUGHT)
-    rsi_oversold = strategy_config.get('RSI_OVERSOLD', RSI_OVERSOLD)
-    rsi_confirm_level_long = strategy_config.get('RSI_CONFIRM_LEVEL_LONG')
-    rsi_confirm_level_short = strategy_config.get('RSI_CONFIRM_LEVEL_SHORT')
+    # Get strategy-specific parameters from strategy_config, with global defaults
+    pt_pct = strategy_config.get('PROFIT_TARGET_PCT', PROFIT_TARGET_PCT)
+    sl_pct = strategy_config.get('STOP_LOSS_PCT', STOP_LOSS_PCT)
+    rsi_ob = strategy_config.get('RSI_OVERBOUGHT', RSI_OVERBOUGHT)
+    rsi_os = strategy_config.get('RSI_OVERSOLD', RSI_OVERSOLD)
+    # Parameters for MACD_RSI strategy
+    rsi_confirm_long = strategy_config.get('RSI_CONFIRM_LEVEL_LONG', 50)
+    rsi_confirm_short = strategy_config.get('RSI_CONFIRM_LEVEL_SHORT', 50)
+    # Parameters for Mean_Reversion_BB_RSI
+    rsi_exit_long_level = strategy_config.get('RSI_EXIT_LONG_LEVEL', 55)
+    rsi_exit_short_level = strategy_config.get('RSI_EXIT_SHORT_LEVEL', 45)
+    # Parameters for Breakout_Volume
+    breakout_period = strategy_config.get('BREAKOUT_PERIOD', 15)
+    volume_factor = strategy_config.get('VOLUME_FACTOR', 1.5)
+
 
     daily_trade_counts = {}
 
-    for i in range(1, len(df)):
+    for i in range(breakout_period, len(df)): # Start loop later if using breakout_period for rolling window
         current_row = df.iloc[i]
         prev_row = df.iloc[i-1]
 
@@ -138,6 +157,45 @@ def run_backtest(df: pd.DataFrame, strategy_config: dict):
                     exit_signal_triggered = True
                     exit_reason = "Stop Loss"
 
+            # Indicator-based Exit
+            indicator_exit_signal = False
+            if not exit_signal_triggered: # Only check if not already exiting
+                indicator_exit_rules = strategy_config.get('indicator_exit', {})
+                exit_rule_type = indicator_exit_rules.get('type')
+
+                if position_type == 'long':
+                    if exit_rule_type == 'ema_cross_against' and \
+                       current_row[indicator_exit_rules['fast_ema']] < current_row[indicator_exit_rules['slow_ema']]:
+                        indicator_exit_signal = True
+                    elif exit_rule_type == 'macd_cross_against' and \
+                         current_row['MACD_12_26_9'] < current_row['MACDs_12_26_9']:
+                        indicator_exit_signal = True
+                    elif exit_rule_type == 'rsi_exit_zone' and \
+                         current_row['RSI_14'] < indicator_exit_rules.get('rsi_level_long', 45): # Exit if RSI drops below a level
+                        indicator_exit_signal = True
+                    elif exit_rule_type == 'bb_middle_touch' and \
+                         current_row['high'] >= current_row['BB_MIDDLE']: # Touches or crosses for long
+                        indicator_exit_signal = True
+
+                elif position_type == 'short':
+                    if exit_rule_type == 'ema_cross_against' and \
+                       current_row[indicator_exit_rules['fast_ema']] > current_row[indicator_exit_rules['slow_ema']]:
+                        indicator_exit_signal = True
+                    elif exit_rule_type == 'macd_cross_against' and \
+                         current_row['MACD_12_26_9'] > current_row['MACDs_12_26_9']:
+                        indicator_exit_signal = True
+                    elif exit_rule_type == 'rsi_exit_zone' and \
+                         current_row['RSI_14'] > indicator_exit_rules.get('rsi_level_short', 55): # Exit if RSI rises above a level
+                        indicator_exit_signal = True
+                    elif exit_rule_type == 'bb_middle_touch' and \
+                         current_row['low'] <= current_row['BB_MIDDLE']: # Touches or crosses for short
+                        indicator_exit_signal = True
+
+            if indicator_exit_signal and not exit_signal_triggered: # Ensure this exit is prioritized if it occurs
+                exit_price = current_row['close']
+                exit_signal_triggered = True
+                exit_reason = "Indicator Exit"
+
             # Time-Based Exit / End of day for current trade
             # Ensure position is closed if it's the last bar for the entry day or EXIT_TIME is reached
             is_last_bar_of_entry_day = (i == len(df) - 1) or (current_row.name.date() != entry_time.date())
@@ -149,14 +207,16 @@ def run_backtest(df: pd.DataFrame, strategy_config: dict):
 
 
             if exit_signal_triggered:
-                pnl_underlying = (exit_price - entry_price) if position_type == 'long' else (entry_price - exit_price)
-                # Simple PNL, not percentage based for commission here
-                pnl_net = pnl_underlying - COMMISSION_PER_TRADE
+                pnl_underlying_abs = (exit_price - entry_price) if position_type == 'long' else (entry_price - exit_price)
+                pnl_underlying_pct = pnl_underlying_abs / entry_price
+                pnl_net_pct = pnl_underlying_pct - COMMISSION_COST_PCT
 
                 trades.append({
                     'entry_time': entry_time, 'exit_time': current_row.name,
                     'entry_price': entry_price, 'exit_price': exit_price,
-                    'pnl_underlying': pnl_underlying, 'pnl_net': pnl_net,
+                    'pnl_underlying_abs': pnl_underlying_abs, # Absolute PnL
+                    'pnl_underlying_pct': pnl_underlying_pct, # PnL as percentage of entry
+                    'pnl_net_pct': pnl_net_pct, # PnL pct after commission
                     'type': position_type, 'exit_reason': exit_reason
                 })
                 in_position = False
@@ -174,41 +234,55 @@ def run_backtest(df: pd.DataFrame, strategy_config: dict):
                     if (prev_row['close'] <= prev_row['VWAP_D']) and \
                        (current_row['close'] > current_row['VWAP_D']) and \
                        (current_row['EMA_9'] > current_row['EMA_21']) and \
-                       (current_row['RSI_14'] < rsi_overbought):
+                       (current_row['RSI_14'] < rsi_ob): # Use strategy-specific rsi_ob
                         long_signal = True
                     elif (prev_row['close'] >= prev_row['VWAP_D']) and \
                          (current_row['close'] < current_row['VWAP_D']) and \
                          (current_row['EMA_9'] < current_row['EMA_21']) and \
-                         (current_row['RSI_14'] > rsi_oversold):
+                         (current_row['RSI_14'] > rsi_os): # Use strategy-specific rsi_os
                         short_signal = True
 
             elif strategy_name == "MACD_RSI":
-                # Ensure MACD columns exist and are not NaN
                 if pd.notna(prev_row['MACD_12_26_9']) and pd.notna(prev_row['MACDs_12_26_9']) and \
                    pd.notna(current_row['MACD_12_26_9']) and pd.notna(current_row['MACDs_12_26_9']) and \
                    pd.notna(current_row['RSI_14']):
-
-                    # Long: MACD crosses above Signal, RSI > confirm level
                     if (prev_row['MACD_12_26_9'] <= prev_row['MACDs_12_26_9']) and \
                        (current_row['MACD_12_26_9'] > current_row['MACDs_12_26_9']) and \
-                       (current_row['RSI_14'] > rsi_confirm_level_long):
+                       (current_row['RSI_14'] > rsi_confirm_long): # Use strategy-specific rsi_confirm_long
                         long_signal = True
-                    # Short: MACD crosses below Signal, RSI < confirm level
                     elif (prev_row['MACD_12_26_9'] >= prev_row['MACDs_12_26_9']) and \
                          (current_row['MACD_12_26_9'] < current_row['MACDs_12_26_9']) and \
-                         (current_row['RSI_14'] < rsi_confirm_level_short):
+                         (current_row['RSI_14'] < rsi_confirm_short): # Use strategy-specific rsi_confirm_short
                         short_signal = True
 
             elif strategy_name == "EMA_CROSS":
                  if pd.notna(prev_row['EMA_5']) and pd.notna(prev_row['EMA_10']) and \
                     pd.notna(current_row['EMA_5']) and pd.notna(current_row['EMA_10']):
-                    # Long: Fast EMA crosses above Slow EMA
                     if (prev_row['EMA_5'] <= prev_row['EMA_10']) and \
                        (current_row['EMA_5'] > current_row['EMA_10']):
                         long_signal = True
-                    # Short: Fast EMA crosses below Slow EMA
                     elif (prev_row['EMA_5'] >= prev_row['EMA_10']) and \
                          (current_row['EMA_5'] < current_row['EMA_10']):
+                        short_signal = True
+
+            elif strategy_name == "Mean_Reversion_BB_RSI":
+                if pd.notna(current_row['BB_LOWER']) and pd.notna(current_row['BB_UPPER']) and pd.notna(current_row['RSI_14']):
+                    if current_row['low'] <= current_row['BB_LOWER'] and current_row['RSI_14'] < rsi_os:
+                        long_signal = True
+                    elif current_row['high'] >= current_row['BB_UPPER'] and current_row['RSI_14'] > rsi_ob:
+                        short_signal = True
+
+            elif strategy_name == "Breakout_Volume":
+                # Ensure enough data for rolling window
+                if i >= breakout_period and pd.notna(current_row['VOLUME_SMA_20']):
+                    # Define breakout period (e.g., previous 'breakout_period' minutes)
+                    lookback_data = df.iloc[i-breakout_period:i]
+                    recent_high = lookback_data['high'].max()
+                    recent_low = lookback_data['low'].min()
+
+                    if current_row['close'] > recent_high and current_row['volume'] > (volume_factor * current_row['VOLUME_SMA_20']):
+                        long_signal = True
+                    elif current_row['close'] < recent_low and current_row['volume'] > (volume_factor * current_row['VOLUME_SMA_20']):
                         short_signal = True
 
             if long_signal:
@@ -216,16 +290,16 @@ def run_backtest(df: pd.DataFrame, strategy_config: dict):
                 position_type = 'long'
                 entry_price = current_row['close']
                 entry_time = current_row.name
-                profit_target_price = entry_price * (1 + profit_target_pct)
-                stop_loss_price = entry_price * (1 - stop_loss_pct)
+                profit_target_price = entry_price * (1 + pt_pct) # Use strategy-specific pt_pct
+                stop_loss_price = entry_price * (1 - sl_pct)   # Use strategy-specific sl_pct
                 daily_trade_counts[current_date] += 1
             elif short_signal:
                 in_position = True
                 position_type = 'short'
                 entry_price = current_row['close']
                 entry_time = current_row.name
-                profit_target_price = entry_price * (1 - profit_target_pct)
-                stop_loss_price = entry_price * (1 + stop_loss_pct)
+                profit_target_price = entry_price * (1 - pt_pct) # Use strategy-specific pt_pct
+                stop_loss_price = entry_price * (1 + sl_pct)     # Use strategy-specific sl_pct
                 daily_trade_counts[current_date] += 1
 
     print(f"Backtest for {strategy_name} complete. Total trades simulated: {len(trades)}")
@@ -262,7 +336,8 @@ def generate_trade_intuition(trades_df, original_data_df, strategy_config):
             f.write(f"- **Exit Time:** {trade['exit_time']}\n")
             f.write(f"- **Exit Price:** {trade['exit_price']:.2f}\n")
             f.write(f"- **Exit Reason:** {trade['exit_reason']}\n")
-            f.write(f"- **PnL (Underlying):** {trade['pnl_underlying']:.2f}\n\n")
+            f.write(f"- **PnL (Underlying Abs):** {trade['pnl_underlying_abs']:.2f}\n")
+            f.write(f"- **PnL (Net %):** {trade['pnl_net_pct']:.4%}\n\n")
 
             # Get indicator states at entry time from the original DataFrame
             # Need to find the row in original_data_df that corresponds to trade['entry_time']
@@ -461,7 +536,7 @@ if __name__ == '__main__':
             # For this implementation, run_backtest doesn't modify df, but copy is safer.
             trades_df = run_backtest(df_qqq_original.copy(), config)
 
-            total_pnl = trades_df['pnl_net'].sum() if not trades_df.empty else 0.0
+            total_pnl = trades_df['pnl_net_pct'].sum() if not trades_df.empty else 0.0 # Corrected key
             num_trades = len(trades_df)
 
             overall_summary_content += f"## Strategy: {strategy_name}\n"
@@ -501,66 +576,3 @@ if __name__ == '__main__':
         with open("trading_analysis_results/strategies_summary.md", "w") as f:
             f.write(overall_summary_content)
         print("\nOverall strategies summary saved to trading_analysis_results/strategies_summary.md")
-
-def generate_trade_intuition(trades_df, original_data_df):
-    """
-    Generates a markdown file with intuition for each trade.
-    """
-    print("\nGenerating trade intuition file...")
-    filepath = "trading_analysis_results/trade_intuition.md"
-    with open(filepath, "w") as f:
-        f.write("# Trade Entry Rationale and Indicator States\n\n")
-        for index, trade in trades_df.iterrows():
-            f.write(f"## Trade {index + 1}: {trade['type'].upper()} at {trade['entry_time']}\n\n")
-            f.write(f"- **Entry Time:** {trade['entry_time']}\n")
-            f.write(f"- **Entry Price:** {trade['entry_price']:.2f}\n")
-            f.write(f"- **Trade Type:** {trade['type']}\n")
-            f.write(f"- **Exit Time:** {trade['exit_time']}\n")
-            f.write(f"- **Exit Price:** {trade['exit_price']:.2f}\n")
-            f.write(f"- **Exit Reason:** {trade['exit_reason']}\n")
-            f.write(f"- **PnL (Underlying):** {trade['pnl_underlying']:.2f}\n\n")
-
-            # Get indicator states at entry time from the original DataFrame
-            # Need to find the row in original_data_df that corresponds to trade['entry_time']
-            # The index of original_data_df is datetime, so direct lookup should work.
-            try:
-                entry_data_row = original_data_df.loc[trade['entry_time']]
-                # Find the previous row for prev_close vs prev_vwap condition check
-                entry_idx = original_data_df.index.get_loc(trade['entry_time'])
-                if entry_idx > 0:
-                    prev_entry_data_row = original_data_df.iloc[entry_idx - 1]
-                else: # Should not happen if backtest starts from index 1 of df_qqq
-                    prev_entry_data_row = None
-
-                f.write("### Indicator States at Entry:\n")
-                f.write(f"- **Current Close:** {entry_data_row['close']:.2f}\n")
-                f.write(f"- **Current VWAP_D:** {entry_data_row['VWAP_D']:.2f}\n")
-                if prev_entry_data_row is not None and pd.notna(prev_entry_data_row['VWAP_D']):
-                    f.write(f"- **Previous Close:** {prev_entry_data_row['close']:.2f}\n")
-                    f.write(f"- **Previous VWAP_D:** {prev_entry_data_row['VWAP_D']:.2f}\n")
-                else:
-                    f.write("- Previous VWAP_D or Close: Not available (likely first valid bar for backtest)\n")
-
-                f.write(f"- **EMA_9:** {entry_data_row['EMA_9']:.2f}\n")
-                f.write(f"- **EMA_21:** {entry_data_row['EMA_21']:.2f}\n")
-                f.write(f"- **RSI_14:** {entry_data_row['RSI_14']:.2f}\n\n")
-
-                f.write("### Entry Rationale:\n")
-                rationale = f"Entered {trade['type']} because: \n"
-                if trade['type'] == 'long':
-                    if prev_entry_data_row is not None and pd.notna(prev_entry_data_row['VWAP_D']):
-                        rationale += f"- Previous Close ({prev_entry_data_row['close']:.2f}) was <= Previous VWAP_D ({prev_entry_data_row['VWAP_D']:.2f}).\n"
-                    rationale += f"- Current Close ({entry_data_row['close']:.2f}) crossed > Current VWAP_D ({entry_data_row['VWAP_D']:.2f}).\n"
-                    rationale += f"- EMA_9 ({entry_data_row['EMA_9']:.2f}) was > EMA_21 ({entry_data_row['EMA_21']:.2f}).\n"
-                    rationale += f"- RSI_14 ({entry_data_row['RSI_14']:.2f}) was < Overbought threshold ({RSI_OVERBOUGHT}).\n"
-                elif trade['type'] == 'short':
-                    if prev_entry_data_row is not None and pd.notna(prev_entry_data_row['VWAP_D']):
-                        rationale += f"- Previous Close ({prev_entry_data_row['close']:.2f}) was >= Previous VWAP_D ({prev_entry_data_row['VWAP_D']:.2f}).\n"
-                    rationale += f"- Current Close ({entry_data_row['close']:.2f}) crossed < Current VWAP_D ({entry_data_row['VWAP_D']:.2f}).\n"
-                    rationale += f"- EMA_9 ({entry_data_row['EMA_9']:.2f}) was < EMA_21 ({entry_data_row['EMA_21']:.2f}).\n"
-                    rationale += f"- RSI_14 ({entry_data_row['RSI_14']:.2f}) was > Oversold threshold ({RSI_OVERSOLD}).\n"
-                f.write(rationale)
-            except KeyError:
-                f.write("Could not retrieve indicator data for this trade's entry time.\n")
-            f.write("\n---\n\n")
-    print(f"Trade intuition file generated at {filepath}")
